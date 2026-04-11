@@ -1,0 +1,8 @@
+__pycache__/
+*.py[cod]
+.venv/
+*.pcd
+*.pt
+*.png
+*.jpg
+.env
