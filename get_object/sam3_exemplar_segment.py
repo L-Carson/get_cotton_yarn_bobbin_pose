@@ -4,22 +4,7 @@
 
 参考: https://docs.ultralytics.com/models/sam-3/
 
-默认权重路径（与脚本同目录）:
-  /home/ly/cursor/mrdvs/get_object/sam3.pt
-
-依赖:
-  pip install -U "ultralytics>=8.3.237" opencv-python pillow numpy torch
-若提示 CLIP 错误: pip uninstall clip -y && pip install git+https://github.com/ultralytics/CLIP.git
-
-说明:
-  - SAM3（Ultralytics）对「目标图」分割时，有效提示是：① 英文 --text；② 在「目标图」像素坐标下的 --target-bbox。
-    不能把「仅图例上的框」自动用到目标图；图例一般配合 BLIP 生成英文概念，再用同一概念在目标图上做文本分割。
-  - 未传 --text 时会尝试用 BLIP 下载/加载模型；若环境配置了 SOCKS 代理且未装 socksio，可能报错，可临时取消代理或: pip install "httpx[socks]"
-  - --ref-box 仅裁剪参考图供 BLIP 看局部，不直接参与 SAM3 几何提示。
-
-用法:cotton yarn bobbin
-  python3 sam3_exemplar_segment.py -e ./rgb_000001.png -t ./rgb_000002.png -o ./sam3_out --text "hand"
-  python3 sam3_exemplar_segment.py -t ./rgb_000002.png -o ./out --text "hand"   # 仅需目标图
+实现见 mrdvs.sam3_seg；本脚本为命令行入口，便于单独调试。
 """
 
 from __future__ import annotations
@@ -29,113 +14,17 @@ import os
 import sys
 from pathlib import Path
 
-_SCRIPT_DIR = Path(__file__).resolve().parent
-_DEFAULT_WEIGHTS = _SCRIPT_DIR / "sam3.pt"
+_HERE = os.path.dirname(os.path.abspath(__file__))
+if _HERE not in sys.path:
+    sys.path.insert(0, _HERE)
 
-
-def _strip_proxy_env() -> None:
-    """避免 BLIP/HuggingFace 下载权重时走 SOCKS 却未安装 socksio 导致失败。"""
-    for k in list(os.environ.keys()):
-        if "proxy" in k.lower():
-            del os.environ[k]
-
-
-def _parse_box(s: str | None) -> tuple[int, int, int, int] | None:
-    if not s:
-        return None
-    parts = s.replace(",", " ").split()
-    if len(parts) != 4:
-        raise ValueError("框需要 4 个数: x1 y1 x2 y2")
-    return tuple(int(x) for x in parts)
-
-
-def _caption_exemplar(pil_img, device: str) -> str:
-    _strip_proxy_env()
-    from transformers import BlipProcessor, BlipForConditionalGeneration
-    import torch
-
-    mid = "Salesforce/blip-image-captioning-base"
-    proc = BlipProcessor.from_pretrained(mid)
-    mdl = BlipForConditionalGeneration.from_pretrained(mid).to(device)
-    mdl.eval()
-    inputs = proc(images=pil_img, return_tensors="pt").to(device)
-    with torch.no_grad():
-        out = mdl.generate(**inputs, max_length=48, num_beams=4)
-    return proc.decode(out[0], skip_special_tokens=True).strip()
-
-
-def _run_sam3_semantic(
-    target_path: str,
-    weights: str,
-    device_str: str,
-    half: bool,
-    conf: float,
-    text_list: list[str] | None,
-    bboxes_xyxy: list[list[float]] | None,
-):
-    from ultralytics.models.sam import SAM3SemanticPredictor
-
-    overrides = dict(
-        conf=conf,
-        iou=0.5,
-        task="segment",
-        mode="predict",
-        model=weights,
-        half=half,
-        save=False,
-        verbose=False,
-    )
-    if device_str:
-        overrides["device"] = device_str
-
-    predictor = SAM3SemanticPredictor(overrides=overrides)
-    predictor.set_image(target_path)
-
-    if bboxes_xyxy is not None and len(bboxes_xyxy) > 0:
-        return predictor(bboxes=bboxes_xyxy)
-    if text_list:
-        return predictor(text=text_list)
-    raise ValueError("需要 --text 或 --target-bbox")
-
-
-def _save_from_results(results, target_path: str, out_dir: str, base: str) -> int:
-    import cv2
-    import numpy as np
-
-    os.makedirs(out_dir, exist_ok=True)
-    res = results[0]
-    img_bgr = cv2.imread(target_path)
-    if img_bgr is None:
-        raise RuntimeError(f"无法读取图像: {target_path}")
-    h, w = img_bgr.shape[:2]
-
-    if res.masks is None or len(res.masks) == 0:
-        print("未检测到实例。", flush=True)
-        return 0
-
-    masks_t = res.masks.data.cpu().numpy()
-    n = masks_t.shape[0]
-    overlay = img_bgr.copy().astype(np.float32)
-
-    for i in range(n):
-        m = masks_t[i]
-        if m.shape[:2] != (h, w):
-            m = cv2.resize(m.astype(np.float32), (w, h), interpolation=cv2.INTER_NEAREST) > 0.5
-        else:
-            m = m > 0.5
-        mask_u8 = (m.astype(np.uint8)) * 255
-        cv2.imwrite(os.path.join(out_dir, f"{base}_mask_{i:02d}.png"), mask_u8)
-        col = (0, 255, 0)
-        for c in range(3):
-            overlay[:, :, c] = np.where(
-                mask_u8 > 0,
-                0.5 * overlay[:, :, c] + 0.5 * col[c],
-                overlay[:, :, c],
-            )
-        print(f"  实例 {i}", flush=True)
-
-    cv2.imwrite(os.path.join(out_dir, f"{base}_overlay.png"), overlay.astype(np.uint8))
-    return n
+from mrdvs.sam3_seg import (
+    DEFAULT_WEIGHTS,
+    caption_exemplar,
+    parse_box,
+    run_sam3_semantic,
+    save_from_results,
+)
 
 
 def main() -> int:
@@ -148,13 +37,13 @@ def main() -> int:
     parser.add_argument(
         "--weights",
         "-w",
-        default=str(_DEFAULT_WEIGHTS),
-        help=f"sam3.pt 路径，默认: {_DEFAULT_WEIGHTS}",
+        default=str(DEFAULT_WEIGHTS),
+        help=f"sam3.pt 路径，默认: {DEFAULT_WEIGHTS}",
     )
     parser.add_argument(
         "--text",
         default="",
-        help="英文概念，如 hand / red mug；不设则尝试 BLIP（需 --exemplar）或 --target-bbox",
+        help="英文概念，如 hand / cotton yarn bobbin；不设则尝试 BLIP（需 --exemplar）或 --target-bbox",
     )
     parser.add_argument(
         "--ref-box",
@@ -209,7 +98,7 @@ def main() -> int:
     text_list: list[str] | None = None
     bbox_tgt: list[list[float]] | None = None
 
-    tb = _parse_box(args.target_bbox.strip() or None)
+    tb = parse_box(args.target_bbox.strip() or None)
     if tb is not None:
         bbox_tgt = [[float(tb[0]), float(tb[1]), float(tb[2]), float(tb[3])]]
 
@@ -228,13 +117,13 @@ def main() -> int:
                 print(f"找不到参考图: {ex_path}", file=sys.stderr)
                 return 1
             img = Image.open(ex_path).convert("RGB")
-            rb = _parse_box(args.ref_box.strip() or None)
+            rb = parse_box(args.ref_box.strip() or None)
             if rb is not None:
                 img = img.crop(rb)
                 print(f"已按 --ref-box 裁剪参考图: {rb}")
             print("BLIP 配文…", flush=True)
             try:
-                concept = _caption_exemplar(img, "cuda" if torch.cuda.is_available() else "cpu")
+                concept = caption_exemplar(img, "cuda" if torch.cuda.is_available() else "cpu")
             except Exception as e:
                 print(
                     f"BLIP 失败: {e}\n"
@@ -250,7 +139,7 @@ def main() -> int:
     print(f"device={device_str} half={use_half}", flush=True)
 
     try:
-        results = _run_sam3_semantic(
+        results = run_sam3_semantic(
             target_path,
             str(wpath),
             device_str,
@@ -275,7 +164,7 @@ def main() -> int:
         with open(os.path.join(out_dir, f"{base}_prompt.txt"), "w", encoding="utf-8") as f:
             f.write(text_list[0] + "\n")
 
-    n = _save_from_results(results, target_path, out_dir, base)
+    n = save_from_results(results, target_path, out_dir, base)
     print(f"完成: {n} 个掩码 -> {out_dir}", flush=True)
     return 0
 

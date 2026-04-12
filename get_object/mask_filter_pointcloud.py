@@ -2,215 +2,25 @@
 """
 用 RGB 上的二值分割 mask，从 LxCamera 导出的稀疏点云（.pcd，仅非零点）中筛出对应 3D 点并保存。
 
-原理: DcSaveXYZ 保存 pcd/ply 时「仅非零数据」，点序与像素不一一对应，不能再用 u+v*W 下标。
-      使用 2D 相机内参将每个 (x,y,z) 投影到 RGB 像素，再与 mask 做与运算。
-
-依赖: pip install opencv-python numpy
-
-示例:
-  python3 mask_filter_pointcloud.py \\
-    --rgb rgb_000001.png \\
-    --pcd pointcloud_000001.pcd \\
-    --mask sam3_out/rgb_000001_mask_00.png \\
-    --out hand_000001.pcd \\
-    --fx 1000 --fy 1000 --cx 960 --cy 540
-
-内参请用本机相机读取（需连接相机、LxCameraSDK）:
-  python3 -c "
-from LxCameraSDK import LxCamera
-from LxCameraSDK.lx_camera_define import *
-import os
-lib = os.environ.get('LX_CAMERA_SDK', '/path/to/libLxCameraApi.so')
-cam = LxCamera(lib)
-# ... DcOpenDevice / DcStartStream 后:
-st, K, dist = cam.get2DIntricParam(handle)
-print('fx,fy,cx,cy:', K)
-"
-
-若更习惯保存「按图像顺序的完整网格」，可将采集改为 DcSaveXYZ(..., 'xxx.txt')，
-再使用本脚本的 --dense-txt 模式（见 --help）。
-
-去噪（分割边缘误包含远处点）:
-  默认对 mask 做腐蚀缩小有效区域，并对保留点的深度 Z 做 MAD 离群剔除（与主体深度差过大的点去掉）。
-  可调 --erode-iters、--z-mad-k；完全关闭深度剔除用 --no-depth-filter。
-
-筛选结果会输出点云重心（各轴坐标算术平均）；可选 --centroid-out 写入一行 x y z。
+实现见包 mrdvs.pc_mask；本脚本仅提供命令行入口，便于单独调试。
 """
 
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import sys
 
+_HERE = os.path.dirname(os.path.abspath(__file__))
+if _HERE not in sys.path:
+    sys.path.insert(0, _HERE)
 
-def _load_ascii_pcd_xyz(path: str):
-    import numpy as np
-
-    data_mode = None
-    with open(path, "r", encoding="utf-8", errors="ignore") as f:
-        for line in f:
-            ls = line.strip()
-            if not ls:
-                continue
-            if ls.upper().startswith("DATA"):
-                parts = ls.split()
-                data_mode = parts[-1] if parts else ""
-                break
-        if not data_mode or data_mode.upper() != "ASCII":
-            raise ValueError(f"需要 ASCII PCD: {path}")
-        arr = np.loadtxt(f, dtype=np.float32)
-    if arr.ndim != 1:
-        arr = arr.reshape(-1)
-    n = len(arr) // 3
-    if n * 3 != len(arr):
-        raise ValueError("PCD 数据列数不是 3 的倍数")
-    return arr.reshape(-1, 3)
-
-
-def _erode_mask(mask_u8, iterations: int, kernel_size: int):
-    """向内收缩前景，减轻分割边界处「一像素混进背景/远处物」的投影误差。"""
-    import cv2
-
-    if iterations <= 0:
-        return mask_u8
-    k = max(3, int(kernel_size))
-    if k % 2 == 0:
-        k += 1
-    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k))
-    return cv2.erode(mask_u8, kernel, iterations=iterations)
-
-
-def _filter_depth_outliers(
-    pts,
-    z_mad_k: float,
-    z_min_band_mm: float,
-    z_max_band_mm: float,
-    passes: int,
-):
-    """
-    按深度 Z（相机前向）做鲁棒离群剔除：以 median(Z) 为中心，允许带宽为
-    max(z_min_band_mm, z_mad_k * 1.4826 * MAD)，可再受 z_max_band_mm 上限约束。
-    对「手 ~480mm、误投影 ~2250mm」这类双峰，MAD 主要由主体决定，远处点易被剔除。
-    """
-    import numpy as np
-
-    out = np.asarray(pts, dtype=np.float32)
-    if out.size == 0:
-        return out
-
-    for _ in range(max(1, passes)):
-        if len(out) < 4:
-            break
-        z = out[:, 2]
-        med = np.median(z)
-        mad = np.median(np.abs(z - med))
-        scale = 1.4826
-        band = z_mad_k * scale * mad
-        band = max(float(z_min_band_mm), band)
-        if z_max_band_mm and z_max_band_mm > 0:
-            band = min(band, float(z_max_band_mm))
-        sel = np.abs(z - med) <= band
-        out = out[sel]
-    return out
-
-
-def _centroid_xyz(pts) -> tuple[float, float, float] | None:
-    """筛选后点云的算术平均重心（相机坐标系，单位与点云一致，一般为 mm）。"""
-    import numpy as np
-
-    pts = np.asarray(pts, dtype=np.float64)
-    if pts.size == 0:
-        return None
-    c = pts.mean(axis=0)
-    return float(c[0]), float(c[1]), float(c[2])
-
-
-def _save_pcd_ascii(path: str, pts) -> None:
-    import numpy as np
-
-    pts = np.asarray(pts, dtype=np.float32)
-    n = pts.shape[0]
-    header = (
-        "# .PCD v0.7 - Point Cloud Data file format\n"
-        "VERSION 0.7\n"
-        "FIELDS x y z\n"
-        "SIZE 4 4 4\n"
-        "TYPE F F F\n"
-        "COUNT 1 1 1\n"
-        f"WIDTH {n}\n"
-        "HEIGHT 1\n"
-        "VIEWPOINT 0 0 0 1 0 0 0\n"
-        f"POINTS {n}\n"
-        "DATA ascii\n"
-    )
-    with open(path, "w", encoding="utf-8") as f:
-        f.write(header)
-        for row in pts:
-            f.write(f"{row[0]:.6f} {row[1]:.6f} {row[2]:.6f}\n")
-
-
-def _project_and_filter(
-    pts,
-    mask_u8,
-    fx: float,
-    fy: float,
-    cx: float,
-    cy: float,
-    z_min: float,
-    flip_v: bool,
-    image_size: tuple[int, int],
-):
-    """pts Nx3, mask_u8 HxW, image_size (W,H)."""
-    import numpy as np
-
-    h, w = mask_u8.shape[:2]
-    W, H = image_size
-    if (w, h) != (W, H):
-        raise ValueError(f"mask 尺寸 {(w,h)} 与 --rgb 期望 {(W,H)} 不一致")
-
-    x, y, z = pts[:, 0], pts[:, 1], pts[:, 2]
-    valid = np.isfinite(x) & np.isfinite(y) & np.isfinite(z) & (np.abs(z) >= z_min)
-    # 与 Z 同号深度（前向为正）；若你的数据全为负 Z，可改符号或调 z_min
-    valid &= z > 0
-
-    u = np.zeros_like(z, dtype=np.float64)
-    v = np.zeros_like(z, dtype=np.float64)
-    u[valid] = fx * x[valid] / z[valid] + cx
-    v[valid] = fy * y[valid] / z[valid] + cy
-    if flip_v:
-        v = (H - 1) - v
-
-    ui = np.rint(u).astype(np.int32)
-    vi = np.rint(v).astype(np.int32)
-    inside = valid & (ui >= 0) & (ui < W) & (vi >= 0) & (vi < H)
-    mhit = np.zeros(len(pts), dtype=bool)
-    mhit[inside] = mask_u8[vi[inside], ui[inside]] > 127
-    return pts[mhit]
-
-
-def _dense_txt_filter(txt_path: str, mask_u8, grid_w: int, grid_h: int):
-    import numpy as np
-    import cv2
-
-    data = np.loadtxt(txt_path, dtype=np.float32)
-    if data.size != grid_w * grid_h * 3:
-        raise ValueError(
-            f"txt 点数 {data.size} != {grid_w}*{grid_h}*3={grid_w*grid_h*3}"
-        )
-    pts = data.reshape(grid_h, grid_w, 3)
-    mh, mw = mask_u8.shape[:2]
-    if (mw, mh) != (grid_w, grid_h):
-        mask_r = cv2.resize(mask_u8, (grid_w, grid_h), interpolation=cv2.INTER_NEAREST)
-    else:
-        mask_r = mask_u8
-    sel = mask_r > 127
-    return pts[sel]
+from mrdvs import pc_mask as PC
 
 
 def main() -> int:
     import cv2
-    import numpy as np
 
     p = argparse.ArgumentParser(
         description="用 SAM 等分割 mask 从稀疏点云 pcd 中筛选并保存",
@@ -300,8 +110,6 @@ def main() -> int:
 
     ij = (args.intrinsics_json or "").strip()
     if ij:
-        import json
-
         with open(os.path.abspath(ij), encoding="utf-8") as f:
             j = json.load(f)
         args.fx = float(j["fx"])
@@ -329,13 +137,13 @@ def main() -> int:
     if mask.shape[:2] != (H, W):
         mask = cv2.resize(mask, (W, H), interpolation=cv2.INTER_NEAREST)
 
-    mask = _erode_mask(mask, args.erode_iters, args.erode_kernel)
+    mask = PC.erode_mask(mask, args.erode_iters, args.erode_kernel)
 
     if use_dense:
         if args.grid_w <= 0 or args.grid_h <= 0:
             print("dense-txt 需要 --grid-w / --grid-h", file=sys.stderr)
             return 1
-        filtered = _dense_txt_filter(
+        filtered = PC.dense_txt_filter(
             os.path.abspath(args.dense_txt), mask, args.grid_w, args.grid_h
         )
     else:
@@ -348,8 +156,8 @@ def main() -> int:
                 file=sys.stderr,
             )
             return 1
-        pts = _load_ascii_pcd_xyz(os.path.abspath(args.pcd))
-        filtered = _project_and_filter(
+        pts = PC.load_ascii_pcd_xyz(os.path.abspath(args.pcd))
+        filtered = PC.project_and_filter(
             pts,
             mask,
             args.fx,
@@ -363,7 +171,7 @@ def main() -> int:
 
     n_before_depth = len(filtered)
     if not args.no_depth_filter and n_before_depth > 0:
-        filtered = _filter_depth_outliers(
+        filtered = PC.filter_depth_outliers(
             filtered,
             args.z_mad_k,
             args.z_min_band_mm,
@@ -376,7 +184,7 @@ def main() -> int:
     out_dir = os.path.dirname(out_path)
     if out_dir:
         os.makedirs(out_dir, exist_ok=True)
-    _save_pcd_ascii(out_path, filtered)
+    PC.save_pcd_ascii(out_path, filtered)
     if args.no_depth_filter:
         print(f"已保存 {n} 点 -> {out_path}（未做深度离群剔除）", flush=True)
     else:
@@ -386,7 +194,7 @@ def main() -> int:
             flush=True,
         )
 
-    cent = _centroid_xyz(filtered)
+    cent = PC.centroid_xyz(filtered)
     if cent is not None:
         cx, cy, cz = cent
         print(
