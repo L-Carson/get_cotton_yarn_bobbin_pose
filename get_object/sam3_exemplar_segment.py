@@ -4,6 +4,10 @@
 
 参考: https://docs.ultralytics.com/models/sam-3/
 
+环境（GPU 推理，与 Ultralytics SAM3 一致）:
+  Python ≥3.12，PyTorch ≥2.7，NVIDIA GPU + 与驱动匹配的 **CUDA 12.6+** PyTorch 构建
+  （安装见 https://pytorch.org ，选择 CUDA 12.6 或更新对应的 wheel）。
+
 实现见 mrdvs.sam3_seg；本脚本为命令行入口，便于单独调试。
 """
 
@@ -22,8 +26,11 @@ from mrdvs.sam3_seg import (
     DEFAULT_WEIGHTS,
     caption_exemplar,
     parse_box,
+    resolve_device,
+    resolve_half,
     run_sam3_semantic,
     save_from_results,
+    ultralytics_device_to_torch,
 )
 
 
@@ -59,12 +66,28 @@ def main() -> int:
     parser.add_argument(
         "--device",
         default="",
-        help="如 cpu 或 0；默认自动",
+        help="如 cpu、0；空则自动选 GPU（有 CUDA 时）",
     )
     parser.add_argument(
-        "--half",
+        "--cpu",
         action="store_true",
-        help="FP16（GPU 上更快；CPU 可不加）",
+        help="强制 CPU",
+    )
+    parser.add_argument(
+        "--fp32",
+        action="store_true",
+        help="GPU 上使用 FP32（默认 FP16 加速）",
+    )
+    parser.add_argument(
+        "--imgsz",
+        type=int,
+        default=0,
+        help="SAM 正方形边长，0=使用 Ultralytics 默认；可试 896/736 降低算量（可能略损精度）",
+    )
+    parser.add_argument(
+        "--compile",
+        action="store_true",
+        help="启用 torch.compile（PyTorch 2+，首次运行会较慢编译）",
     )
     args = parser.parse_args()
 
@@ -87,13 +110,11 @@ def main() -> int:
 
     import torch
 
-    device_str = args.device
-    if not device_str:
+    if args.cpu:
         device_str = "cpu"
-        if torch.cuda.is_available():
-            device_str = "0"
-
-    use_half = args.half and torch.cuda.is_available()
+    else:
+        device_str = (args.device or "").strip() or resolve_device("")
+    use_half = resolve_half(False if args.fp32 else None, device_str)
 
     text_list: list[str] | None = None
     bbox_tgt: list[list[float]] | None = None
@@ -123,7 +144,9 @@ def main() -> int:
                 print(f"已按 --ref-box 裁剪参考图: {rb}")
             print("BLIP 配文…", flush=True)
             try:
-                concept = caption_exemplar(img, "cuda" if torch.cuda.is_available() else "cpu")
+                concept = caption_exemplar(
+                    img, ultralytics_device_to_torch(device_str)
+                )
             except Exception as e:
                 print(
                     f"BLIP 失败: {e}\n"
@@ -136,8 +159,13 @@ def main() -> int:
         text_list = [concept]
 
     print(f"权重: {wpath}", flush=True)
-    print(f"device={device_str} half={use_half}", flush=True)
+    print(
+        f"device={device_str} fp16={use_half} | "
+        f"cuda={torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'N/A'}",
+        flush=True,
+    )
 
+    imgsz_kw = None if args.imgsz <= 0 else args.imgsz
     try:
         results = run_sam3_semantic(
             target_path,
@@ -147,6 +175,8 @@ def main() -> int:
             args.conf,
             text_list,
             bbox_tgt,
+            imgsz=imgsz_kw,
+            compile_graph=args.compile,
         )
     except Exception as e:
         print(

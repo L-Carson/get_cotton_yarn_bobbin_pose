@@ -1,4 +1,9 @@
-"""Ultralytics SAM3：文本/框分割；支持文件路径或 BGR ndarray。"""
+"""Ultralytics SAM3：文本/框分割；支持文件路径或 BGR ndarray。
+
+官方环境（SAM3 / Ultralytics，GPU 推理）：Python ≥3.12、PyTorch ≥2.7、
+NVIDIA GPU 且使用 **CUDA 12.6+** 对应的 PyTorch 轮子（如 cu126，以 pytorch.org 为准）。
+驱动需不低于该 CUDA 版本对驱动的最低要求。
+"""
 
 from __future__ import annotations
 
@@ -8,6 +13,142 @@ from pathlib import Path
 
 _SCRIPT_DIR = Path(__file__).resolve().parent.parent
 DEFAULT_WEIGHTS = _SCRIPT_DIR / "sam3.pt"
+
+_GPU_TUNED = False
+
+
+def configure_pytorch_gpu() -> None:
+    """在首次使用 GPU 推理前调用：cuDNN benchmark、TF32、矩阵乘精度（Tensor Core）。"""
+    global _GPU_TUNED
+    if _GPU_TUNED:
+        return
+    try:
+        import torch
+
+        if not torch.cuda.is_available():
+            _GPU_TUNED = True
+            return
+        torch.backends.cudnn.benchmark = True
+        if hasattr(torch.backends.cuda, "matmul") and hasattr(
+            torch.backends.cuda.matmul, "allow_tf32"
+        ):
+            torch.backends.cuda.matmul.allow_tf32 = True
+        if hasattr(torch.backends.cudnn, "allow_tf32"):
+            torch.backends.cudnn.allow_tf32 = True
+        # Ampere+ 上加速 FP32 matmul（与 half 推理可并存）
+        try:
+            torch.set_float32_matmul_precision("high")
+        except Exception:
+            pass
+        _GPU_TUNED = True
+    except Exception:
+        _GPU_TUNED = True
+
+
+def build_sam3_overrides(
+    *,
+    weights: str,
+    device: str,
+    half: bool,
+    conf: float,
+    imgsz: int | None = None,
+    compile_graph: bool | str = False,
+) -> dict:
+    """Ultralytics SAM3SemanticPredictor 的 overrides 公共构造。"""
+    o = dict(
+        conf=conf,
+        iou=0.5,
+        task="segment",
+        mode="predict",
+        model=weights,
+        half=half,
+        save=False,
+        verbose=False,
+        device=device,
+    )
+    if imgsz is not None:
+        o["imgsz"] = int(imgsz)
+    if compile_graph:
+        o["compile"] = compile_graph if isinstance(compile_graph, str) else True
+    return o
+
+
+def resolve_device(device: str = "") -> str:
+    """空字符串：有 CUDA 用 ``0``，否则 ``cpu``。"""
+    import torch
+
+    d = (device or "").strip()
+    if d:
+        return d
+    return "0" if torch.cuda.is_available() else "cpu"
+
+
+def explain_cuda_unavailable_if_needed() -> None:
+    """在 import torch 之后调用：说明为何未用 GPU（驱动/PyTorch 不匹配等）。"""
+    import torch
+
+    if torch.cuda.is_available():
+        return
+    lines = [
+        "[SAM3] 当前未启用 CUDA，将使用 CPU 推理（SAM3 在 CPU 上往往每帧数秒，属正常）。",
+        "  SAM3 建议环境: Python≥3.12, PyTorch≥2.7, GPU 需 CUDA 12.6+ 的 PyTorch 构建（见 https://pytorch.org）。",
+    ]
+    cv = getattr(torch.version, "cuda", None)
+    if cv:
+        lines.append(
+            f"  PyTorch 为 CUDA 构建 (torch.version.cuda={cv})，但 cuda.is_available()=False，"
+            "多为显卡驱动版本低于当前 PyTorch 所需的 CUDA 运行时。"
+        )
+        lines.append(
+            "  处理: ① 升级 NVIDIA 驱动至支持所用 CUDA 版本；② 或重装与驱动匹配的 torch（GPU 推荐 cu126 等与 CUDA≥12.6 对应的轮子）。"
+        )
+    else:
+        lines.append(
+            "  当前为 CPU 版 PyTorch；若需 GPU 请安装带 CUDA 12.6+ 的 torch（PyTorch≥2.7, Python≥3.12）。"
+        )
+    print("\n".join(lines), flush=True)
+
+
+def resolve_imgsz_for_runtime(
+    user_imgsz: int,
+    device_str: str,
+    *,
+    auto_cpu_imgsz: int = 640,
+    no_auto: bool = False,
+) -> tuple[int | None, str]:
+    """
+    返回 (传给 Ultralytics 的 imgsz, 说明字符串)。
+    user_imgsz>0: 用户指定；=0 且 CPU 且非 no_auto: 使用 auto_cpu_imgsz；否则 None（Ultralytics 默认）。
+    """
+    import torch
+
+    if user_imgsz > 0:
+        return user_imgsz, f"user={user_imgsz}"
+    use_cpu = device_str.strip() == "cpu" or not torch.cuda.is_available()
+    if use_cpu and not no_auto:
+        return auto_cpu_imgsz, f"auto_cpu={auto_cpu_imgsz}"
+    return None, "ultralytics_default"
+
+
+def resolve_half(fp16: bool | None, device_str: str) -> bool:
+    """fp16 is None：仅在 CUDA 上默认开 FP16。"""
+    import torch
+
+    if fp16 is not None:
+        return bool(fp16) and torch.cuda.is_available()
+    return torch.cuda.is_available() and device_str not in ("cpu",)
+
+
+def ultralytics_device_to_torch(device_str: str) -> str:
+    """供 transformers 等使用：``0`` -> ``cuda:0``。"""
+    s = device_str.strip()
+    if s == "cpu" or not s:
+        return "cpu"
+    if s.isdigit():
+        return f"cuda:{s}"
+    if s.startswith("cuda"):
+        return s
+    return s
 
 
 def strip_proxy_env() -> None:
@@ -48,30 +189,36 @@ def run_sam3_semantic(
     conf: float,
     text_list: list[str] | None,
     bboxes_xyxy: list[list[float]] | None,
+    *,
+    imgsz: int | None = None,
+    compile_graph: bool | str = False,
 ):
     """target_source: 图像路径(str) 或 BGR ndarray。"""
+    import torch
     from ultralytics.models.sam import SAM3SemanticPredictor
 
-    overrides = dict(
-        conf=conf,
-        iou=0.5,
-        task="segment",
-        mode="predict",
-        model=weights,
+    ds = (device_str or "").strip()
+    dev = resolve_device("") if not ds else ds
+    if dev != "cpu":
+        configure_pytorch_gpu()
+
+    overrides = build_sam3_overrides(
+        weights=weights,
+        device=dev,
         half=half,
-        save=False,
-        verbose=False,
+        conf=conf,
+        imgsz=imgsz,
+        compile_graph=compile_graph,
     )
-    if device_str:
-        overrides["device"] = device_str
 
     predictor = SAM3SemanticPredictor(overrides=overrides)
-    predictor.set_image(target_source)
+    with torch.inference_mode():
+        predictor.set_image(target_source)
 
-    if bboxes_xyxy is not None and len(bboxes_xyxy) > 0:
-        return predictor(bboxes=bboxes_xyxy)
-    if text_list:
-        return predictor(text=text_list)
+        if bboxes_xyxy is not None and len(bboxes_xyxy) > 0:
+            return predictor(bboxes=bboxes_xyxy)
+        if text_list:
+            return predictor(text=text_list)
     raise ValueError("需要 text_list 或 bboxes_xyxy")
 
 
@@ -144,8 +291,11 @@ class Sam3Segmenter:
         self,
         weights: str | Path | None = None,
         device: str = "",
-        half: bool = False,
+        half: bool | None = None,
         conf: float = 0.25,
+        *,
+        imgsz: int | None = None,
+        compile_graph: bool | str = False,
     ):
         import torch
 
@@ -153,13 +303,14 @@ class Sam3Segmenter:
         if not Path(self._weights).is_file():
             raise FileNotFoundError(f"未找到权重: {self._weights}")
 
-        if not device:
-            device = "cpu"
-            if torch.cuda.is_available():
-                device = "0"
-        self._device = device
-        self._half = bool(half and torch.cuda.is_available())
+        ds = (device or "").strip()
+        self._device = resolve_device("") if not ds else ds
+        if self._device != "cpu":
+            configure_pytorch_gpu()
+        self._half = resolve_half(half, self._device)
         self._conf = conf
+        self._imgsz = imgsz
+        self._compile_graph = compile_graph
         self._predictor = None
 
     def _ensure_predictor(self):
@@ -167,19 +318,39 @@ class Sam3Segmenter:
             return self._predictor
         from ultralytics.models.sam import SAM3SemanticPredictor
 
-        overrides = dict(
-            conf=self._conf,
-            iou=0.5,
-            task="segment",
-            mode="predict",
-            model=self._weights,
-            half=self._half,
-            save=False,
-            verbose=False,
+        overrides = build_sam3_overrides(
+            weights=self._weights,
             device=self._device,
+            half=self._half,
+            conf=self._conf,
+            imgsz=self._imgsz,
+            compile_graph=self._compile_graph,
         )
         self._predictor = SAM3SemanticPredictor(overrides=overrides)
         return self._predictor
+
+    @property
+    def device(self) -> str:
+        return self._device
+
+    @property
+    def use_fp16(self) -> bool:
+        return self._half
+
+    def warmup(
+        self,
+        text_list: list[str] | None = None,
+        bboxes_xyxy: list[list[float]] | None = None,
+    ) -> None:
+        """一次空图推理，预热 CUDA/cuDNN/torch.compile，减轻首帧卡顿。"""
+        import numpy as np
+
+        dummy = np.zeros((480, 640, 3), dtype=np.uint8)
+        self.predict(
+            dummy,
+            text_list=text_list or ["object"],
+            bboxes_xyxy=bboxes_xyxy,
+        )
 
     def predict(
         self,
@@ -190,12 +361,15 @@ class Sam3Segmenter:
         """
         image_bgr: 路径 str 或 BGR uint8 ndarray。
         """
+        import torch
+
         pred = self._ensure_predictor()
-        pred.set_image(image_bgr)
-        if bboxes_xyxy is not None and len(bboxes_xyxy) > 0:
-            return pred(bboxes=bboxes_xyxy)
-        if text_list:
-            return pred(text=text_list)
+        with torch.inference_mode():
+            pred.set_image(image_bgr)
+            if bboxes_xyxy is not None and len(bboxes_xyxy) > 0:
+                return pred(bboxes=bboxes_xyxy)
+            if text_list:
+                return pred(text=text_list)
         raise ValueError("需要 text_list 或 bboxes_xyxy")
 
     def predict_masks_u8(
